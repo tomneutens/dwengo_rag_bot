@@ -1,0 +1,6 @@
+learning_content
+dwengo_faiss
+dwengo_faiss.index
+.venv
+dwengo_faiss.meta.json
+__pycache__

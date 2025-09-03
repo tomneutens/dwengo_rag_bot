@@ -1,0 +1,150 @@
+<!-- Chat Widget -->
+<div id="dwengo-chat-widget">
+  <div id="dwengo-chat-header">Chat with our Bot</div>
+  <div id="dwengo-chat-messages"></div>
+  <div id="dwengo-chat-input">
+    <input type="text" id="dwengo-chat-text" placeholder="Type your message..." />
+    <button id="dwengo-chat-send">Send</button>
+  </div>
+</div>
+
+<style>
+#dwengo-chat-widget {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 300px;
+  max-height: 400px;
+  background: white;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  font-family: Arial, sans-serif;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+  overflow: hidden;
+  z-index: 9999;
+}
+#dwengo-chat-header {
+  background: #0077cc;
+  color: white;
+  padding: 10px;
+  font-weight: bold;
+  text-align: center;
+}
+#dwengo-chat-messages {
+  flex: 1;
+  padding: 10px;
+  overflow-y: auto;
+  font-size: 14px;
+}
+#dwengo-chat-messages .user {
+  text-align: right;
+  color: #0077cc;
+  margin: 5px 0;
+}
+#dwengo-chat-messages .bot {
+  text-align: left;
+  color: #333;
+  margin: 5px 0;
+  white-space: pre-wrap;
+}
+#dwengo-chat-input {
+  display: flex;
+  border-top: 1px solid #ccc;
+}
+#dwengo-chat-input input {
+  flex: 1;
+  border: none;
+  padding: 10px;
+  font-size: 14px;
+}
+#dwengo-chat-input button {
+  background: #0077cc;
+  border: none;
+  color: white;
+  padding: 0 15px;
+  cursor: pointer;
+}
+#dwengo-chat-input button:hover {
+  background: #005fa3;
+}
+</style>
+
+<script>
+const apiUrl = "/bot/chat"; // adjust if hosted elsewhere
+
+document.getElementById("dwengo-chat-send").addEventListener("click", sendMessage);
+document.getElementById("dwengo-chat-text").addEventListener("keypress", function(e) {
+  if (e.key === "Enter") sendMessage();
+});
+
+async function sendMessage() {
+  const input = document.getElementById("dwengo-chat-text");
+  const message = input.value.trim();
+  if (!message) return;
+
+  appendMessage("user", message);
+  input.value = "";
+
+  // Create a placeholder for streaming response
+  const botMsgElem = appendMessage("bot", "");
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "DWENGO-API-KEY": "changeme" // adjust if required
+      },
+      body: JSON.stringify({ query: message, stream: true })
+    });
+
+    if (!response.ok || !response.body) {
+      botMsgElem.textContent = "Error connecting to server.";
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE events are separated by double newlines
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop(); // save incomplete part
+
+      for (const part of parts) {
+        if (part.startsWith("data:")) {
+          const token = part.slice(5).trim();
+          botMsgElem.textContent += token;
+          scrollMessages();
+        }
+      }
+    }
+  } catch (err) {
+    botMsgElem.textContent = "Error fetching response.";
+    console.error(err);
+  }
+}
+
+function appendMessage(sender, text) {
+  const messagesDiv = document.getElementById("dwengo-chat-messages");
+  const msg = document.createElement("div");
+  msg.className = sender;
+  msg.textContent = text;
+  messagesDiv.appendChild(msg);
+  scrollMessages();
+  return msg; // return the element so we can update it while streaming
+}
+
+function scrollMessages() {
+  const messagesDiv = document.getElementById("dwengo-chat-messages");
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+</script>
