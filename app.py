@@ -49,7 +49,7 @@ import shutil
 import logging
 import asyncio
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import faiss  # type: ignore
@@ -73,19 +73,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 REPO_URL = os.getenv("DWENGO_REPO_URL", "https://github.com/dwengovzw/learning_content")
 DATA_DIR = Path(os.getenv("DATA_DIR", "./learning_content"))
-INDEX_PATH = Path(os.getenv("INDEX_PATH", "./dwengo_faiss.index"))
-META_PATH = Path(os.getenv("META_PATH", "./dwengo_faiss.meta.json"))
+# Additional content source: Jupyter notebooks repo
+NOTEBOOKS_REPO_URL = os.getenv("DWENGO_NOTEBOOKS_REPO_URL", "https://github.com/dwengovzw/PythonNotebooks")
+NOTEBOOKS_DIR = Path(os.getenv("DWENGO_NOTEBOOKS_DIR", "./python_notebooks"))
+INDEX_PATH = Path(os.getenv("INDEX_PATH", "./dwengo_faiss2.index"))
+META_PATH = Path(os.getenv("META_PATH", "./dwengo_faiss2.meta.json"))
 EMB_MODEL = os.getenv("EMB_MODEL", "intfloat/multilingual-e5-large-instruct")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-SYNC_REPO = os.getenv("SYNC_REPO", "false").lower() == "true"
+#LLM_MODEL = os.getenv("LLM_MODEL", "google/gemma-3-12b-it")
+SYNC_REPO = os.getenv("SYNC_REPO", "true").lower() == "true"
 API_KEY = os.getenv("API_KEY")  # optional
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",")]
 
 SYSTEM_PROMPT = (
-    "Je bent een helpende onderwijsassistent. Beantwoord in het Nederlands wanneer de vraag in het Nederlands is. "
+    "Je bent de helpende onderwijsassistent van Dwengo vzw. Dwengo is een organisatie die gratis lesmateriaal maakt over AI, robotica, computationeel denken, STEM en physical computing."
+    "Dwengo richt zich op leerkrachten en leerlingen in het secundair onderwijs in Vlaanderen en Nederland."
+    "Beantwoord in het Nederlands wanneer de vraag in het Nederlands is. "
     "Gebruik de contextfragmenten uit het Dwengo-leermateriaal om nauwkeurige, brongebonden antwoorden te geven. "
     "Neem geen links op in je antwoorden. Verwijs niet naar bronnen."
     "Als je het antwoord niet met zekerheid weet vanuit de context, zeg dan eerlijk dat je het niet zeker weet."
+    "Vervang eventuele markdown in je antwoord door html. Geef codefragmenten weern in een codeblok met de juiste taal."
 )
 INSTRUCT_EMBED_PREFIX = "Instruct: Represent the query for retrieving supporting passages: "
 INSTRUCT_PASSAGE_PREFIX = "Passage: "
@@ -95,6 +102,12 @@ MD_EXTS = {".md", ".markdown"}
 API_KEY_HEADER_KEY = "DWENGO-API-KEY"
 DWENGO_WEBSITE_CONTENT_TYPE = "DWENGO_WEBSITE_CONTENT"
 DWENGO_PYTHON_NOTEBOOK_TYPE = "DWENGO_PYTHON_NOTEBOOK"
+
+# Notebook ingestion controls
+NB_INCLUDE_CODE = os.getenv("DWENGO_NB_INCLUDE_CODE", "false").lower() == "true"
+NB_MAX_BYTES = int(os.getenv("DWENGO_NB_MAX_BYTES", "4000000"))  # 4 MB
+NB_MAX_CODE_CHARS = int(os.getenv("DWENGO_NB_MAX_CODE_CHARS", "2000"))
+NB_MAX_TEXT_CHARS = int(os.getenv("DWENGO_NB_MAX_TEXT_CHARS", "120000"))
 
 # -----------------------------
 # Security
@@ -125,8 +138,10 @@ async def require_api_key(request: Request):
 # -----------------------------
 
 def clone_or_update_repo(repo_url: str, dest_dir: Path) -> None:
+    print(f"[repo] ensure {dest_dir} from {repo_url}")
     if dest_dir.exists() and (dest_dir / ".git").exists():
         LOG.info("Updating repo at %s", dest_dir)
+        print(f"[repo] update {dest_dir}")
         repo = Repo(str(dest_dir))
         repo.remotes.origin.fetch()
         repo.git.reset("--hard", "origin/HEAD")
@@ -134,15 +149,17 @@ def clone_or_update_repo(repo_url: str, dest_dir: Path) -> None:
         if dest_dir.exists():
             shutil.rmtree(dest_dir)
         LOG.info("Cloning repo to %s", dest_dir)
+        print(f"[repo] clone into {dest_dir}")
         Repo.clone_from(repo_url, str(dest_dir))
 
 
 def read_markdown_files(root: Path) -> List[Dict[str, Any]]:
+    print(f"[ingest-md] scanning {root}")
     items: List[Dict[str, Any]] = []
     for p in root.rglob("*"):
         if p.suffix.lower() in MD_EXTS and p.is_file():
             try:
-                post = frontmatter.load(p)
+                post = frontmatter.load(str(p))
                 metadata = post.metadata or {}
                 text = str(post.content)
                 items.append({
@@ -151,15 +168,96 @@ def read_markdown_files(root: Path) -> List[Dict[str, Any]]:
                     "hruid": metadata.get("hruid"),
                     "language": metadata.get("language"),
                     "title": metadata.get("title"),
-                    "description": metadata.get("description"),
-                    "keywords": metadata.get("keywords"),
                     "estimated_time": metadata.get("estimated_time"),
                     "target_ages": metadata.get("target_ages"),
-                    "teacher_exclusive": metadata.get("teacher_exclusive"),
-                    "raw": text,
+                    "_source_type": DWENGO_WEBSITE_CONTENT_TYPE,
                 })
             except Exception as e:
                 LOG.warning("Could not parse %s: %s", p, e)
+    print(f"[ingest-md] parsed {len(items)} files")
+    return items
+
+def read_notebook_files(root: Path) -> List[Dict[str, Any]]:
+    """Read notebooks listed in PythonNotebooks.json (in repo root),
+    extract textual content and return items ready for embedding.
+
+    For each JSON entry, use the entry key as hruid, Name as title, Description as description,
+    and include each .ipynb from the Files array. Non-notebook files are ignored.
+    """
+    items: List[Dict[str, Any]] = []
+    index_path = root / "PythonNotebooks.json"
+    print(f"[ingest-nb] index: {index_path}")
+    if not index_path.exists():
+        LOG.warning("Notebook index JSON not found at %s; skipping notebook ingestion.", index_path)
+        return items
+
+    try:
+        notebook_index = json.loads(index_path.read_text(encoding="utf-8"))
+        if isinstance(notebook_index, dict):
+            print(f"[ingest-nb] entries: {len(notebook_index)}")
+    except Exception as e:
+        LOG.error("Failed to parse %s: %s", index_path, e)
+        return items
+
+    def detect_language(entry_key: str, base_path: Optional[str], rel_path: str) -> str:
+        if entry_key.endswith("_en") or (base_path and base_path.startswith("en/")) or rel_path.startswith("en/"):
+            return "en"
+        return "nl"
+
+    total_listed = 0
+    total_parsed = 0
+    for entry_key, entry in (notebook_index.items() if isinstance(notebook_index, dict) else []):
+        print(f"[ingest-nb] entry: {entry_key}")
+        try:
+            files = entry.get("Files", []) if isinstance(entry, dict) else []
+            base_path = entry.get("BasePath") if isinstance(entry, dict) else None
+            title = entry.get("Name") if isinstance(entry, dict) else None
+            description = entry.get("Description") if isinstance(entry, dict) else None
+            print(f"[ingest-nb]  description: {description}")
+            for rel in files:
+                if not isinstance(rel, str) or not rel.endswith(".ipynb"):
+                    continue
+                p = root / rel
+                total_listed += 1
+                if not p.exists() or not p.is_file():
+                    LOG.warning("Listed notebook not found: %s (entry %s)", p, entry_key)
+                    continue
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    
+                    cells = data.get("cells", [])
+                    parts: List[str] = []
+                    for cell in cells:
+                        ctype = cell.get("cell_type")
+                        src = cell.get("source", [])
+                        src_text = "".join(src) if isinstance(src, list) else str(src)
+                        if ctype == "markdown":
+                            parts.append(src_text)
+                        elif ctype == "code":
+                            if src_text.strip():
+                                parts.append(f"\n```python\n{src_text}\n```\n")
+                    text = "\n\n".join([t for t in parts if t.strip()])
+                    print(f"[ingest-nb]  text: {text[:100]}... (truncated)")
+                    lang = detect_language(entry_key, base_path, rel)
+                    print(f"[ingest-nb]  parsed {p} (lang={lang}, chunks TBD)")
+                    items.append({
+                        "path": str(p),
+                        "text": text,
+                        "hruid": entry_key,  # use JSON entry key as id
+                        "language": lang,
+                        "title": title or p.stem,
+                        "description": description,
+                        "_source_type": DWENGO_PYTHON_NOTEBOOK_TYPE,
+                    })
+                    total_parsed += 1
+                    print(f"[ingest-nb]  parsed {p} total_parsed {total_parsed} (lang={lang}, chunks TBD)")
+                except Exception as e:
+                    LOG.warning("Could not parse notebook %s (entry %s): %s", p, entry_key, e)
+                    print(f"[ingest-nb]  could not parse {p} (entry {entry_key}): {e}")
+        except Exception as e:
+            LOG.warning("Skipping entry %s due to error: %s", entry_key, e)
+            print(f"[ingest-nb]  skipping entry {entry_key} due to error: {e}")
+    print(f"[ingest-nb] listed {total_listed}, parsed {total_parsed}, items {len(items)}")
     return items
 
 def read_learning_paths(root: Path) -> List[Dict[str, Any]]:
@@ -186,7 +284,7 @@ def split_markdown(text: str, max_tokens: int = 400) -> List[str]:
     parts = re.split(r"\n(?=#+\s)" , text)
 
     chunks = []
-    for part in parts:
+            for rel in files:
         words = part.split()
         if not words:
             continue
@@ -194,19 +292,42 @@ def split_markdown(text: str, max_tokens: int = 400) -> List[str]:
         count = 0
         for w in words:
             cur.append(w)
+                try:
+                    size = p.stat().st_size
+                except Exception:
+                    size = 0
+                if NB_MAX_BYTES and size and size > NB_MAX_BYTES:
+                    LOG.warning("Skipping large notebook (%d bytes): %s", size, p)
+                    continue
             count += 1
             if count >= max_tokens:
                 chunks.append(" ".join(cur))
                 cur = []
+                    total_chars = 0
                 count = 0
         if cur:
             chunks.append(" ".join(cur))
 
     # Fallback if no headers
-    if not chunks:
+                            if src_text:
+                                if NB_MAX_TEXT_CHARS and (total_chars + len(src_text) > NB_MAX_TEXT_CHARS):
+                                    remain = max(0, NB_MAX_TEXT_CHARS - total_chars)
+                                    parts.append(src_text[:remain])
+                                    total_chars += remain
+                                    break
+                                parts.append(src_text)
+                                total_chars += len(src_text)
         words = text.split()
-        cur = []
-        for w in words:
+                            if NB_INCLUDE_CODE and src_text.strip():
+                                code_snip = src_text[:NB_MAX_CODE_CHARS] if NB_MAX_CODE_CHARS else src_text
+                                block = f"\n```python\n{code_snip}\n```\n"
+                                if NB_MAX_TEXT_CHARS and (total_chars + len(block) > NB_MAX_TEXT_CHARS):
+                                    remain = max(0, NB_MAX_TEXT_CHARS - total_chars)
+                                    parts.append(block[:remain])
+                                    total_chars += remain
+                                    break
+                                parts.append(block)
+                                total_chars += len(block)
             cur.append(w)
             if len(cur) >= max_tokens:
                 chunks.append(" ".join(cur)); cur = []
@@ -223,7 +344,8 @@ class VectorStore:
 
     def add(self, embs: np.ndarray, metas: List[Dict[str, Any]]):
         assert embs.shape[0] == len(metas)
-        self.index.add(embs.astype(np.float32))
+        # faiss typings vary; at runtime this accepts a (n,d) float32 array
+        self.index.add(embs.astype(np.float32))  # type: ignore[arg-type]
         self.docs.extend(metas)
 
     def save(self, index_path: Path, meta_path: Path):
@@ -244,13 +366,17 @@ class VectorStore:
 # -----------------------------
 app = FastAPI(title="Dwengo RAG Service", version=APP_VERSION)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if CORS_ORIGINS == ["*"] else CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+# Disable cors since it is handled by the reverse proxy (nginx)
+#LOG.info(f"cors: {CORS_ORIGINS}")
+#print(f"cors: {CORS_ORIGINS}")
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"] if CORS_ORIGINS == ["*"] else CORS_ORIGINS,
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"]
+# )
 
 _embedder: Optional[SentenceTransformer] = None
 _vstore: Optional[VectorStore] = None
@@ -287,15 +413,18 @@ async def ensure_ready():
 
 def embed_passages(passages: List[str]) -> np.ndarray:
     assert _embedder is not None
+    print(f"[embed] encoding {len(passages)} passages …")
     embs = _embedder.encode(passages, batch_size=64, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+    print(f"[embed] done: shape={embs.shape}")
     return embs.astype(np.float32)
 
 
 def retrieve(query: str, k: int) -> List[Dict[str, Any]]:
     assert _embedder is not None and _vstore is not None
     q = INSTRUCT_EMBED_PREFIX + query
+    print(f"[retrieve] k={k}, query='{query[:80]}{'…' if len(query)>80 else ''}'")
     q_emb = _embedder.encode([q], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-    D, I = _vstore.index.search(q_emb, k)
+    D, I = _vstore.index.search(q_emb, k)  # type: ignore[call-arg]
     hits: List[Dict[str, Any]] = []
     for idx, score in zip(I[0], D[0]):
         if idx == -1:
@@ -303,10 +432,15 @@ def retrieve(query: str, k: int) -> List[Dict[str, Any]]:
         doc = dict(_vstore.docs[idx])
         doc["score"] = float(score)
         hits.append(doc)
+    if hits:
+        print(f"[retrieve] hits={len(hits)}, top_score={hits[0]['score']:.4f}")
+    else:
+        print("[retrieve] no hits")
     return hits
 
 
 def build_prompt(query: str, contexts: List[Dict[str, Any]], history: Optional[List[Tuple[str, str]]] = None) -> str:
+    print(f"[prompt] contexts={len(contexts)}, history={'yes' if history else 'no'}")
     ctx_blocks = []
     for c in contexts:
         header = f"Bron: {Path(c.get('path',''))}\nTitel: {c.get('title')}\nTaal: {c.get('language')}".strip()
@@ -322,12 +456,14 @@ def build_prompt(query: str, contexts: List[Dict[str, Any]], history: Optional[L
     prompt = (
         (hist_txt + "\n") if hist_txt else ""
         ) + f"<|system|>\n{SYSTEM_PROMPT}\n</|system|>\n" \
-        f"<|user|>\nVraag: {query}\n\nHier zijn relevante fragmenten. Gebruik ze als betrouwbare bron.\n\n{joined_ctx}\n\nGeef een beknopt antwoord en citeer de bron(nen) met pad + titel.\n</|user|>\n"
+        f"<|user|>\nVraag: {query}\n\nHier zijn relevante fragmenten. Gebruik ze als betrouwbare bron.\n\n{joined_ctx}\n\nGeef een beknopt antwoord citeer geen bronnen.\n</|user|>\n"
+    print(f"[prompt] length={len(prompt)}")
     return prompt
 
 
 async def generate_text(prompt: str, max_new_tokens: int, temperature: float, top_p: float, stream: bool, source_links: List[str]):
     assert _model is not None and _tokenizer is not None
+    print(f"[gen] stream={stream}, max_new_tokens={max_new_tokens}, temp={temperature}, top_p={top_p}")
     inputs = _tokenizer(prompt, return_tensors="pt").to(_model.device)
     streamer = TextIteratorStreamer(_tokenizer, skip_prompt=True, skip_special_tokens=True)
     gen_kwargs = dict(
@@ -341,28 +477,33 @@ async def generate_text(prompt: str, max_new_tokens: int, temperature: float, to
 
     async with _generate_lock:
         loop = asyncio.get_event_loop()
-        thread = asyncio.to_thread(_model.generate, **gen_kwargs)
+        thread = asyncio.to_thread(_model.generate, **gen_kwargs)  # type: ignore[arg-type]
 
         def stream_tokens():
             for token in streamer:
                 yield token
 
         gen_task = loop.create_task(thread)
-        lp_links_html = f"<br>{"<br>".join(source_links)}"
+        lp_links_html =  f"<br>Bronnen:<br>{"<br>".join(source_links)}"
 
         if stream:
             async def agen():
+                token_count = 0
                 for tok in stream_tokens():
+                    token_count += 1
                     yield f"data: {tok}\n\n"
                 await gen_task
                 if source_links:
                     yield f"data: {lp_links_html}\n\n"
+                    print(f"Streamed source links")
+                print(f"[gen] streamed tokens={token_count}, appended_links={bool(lp_links_html)}")
             return StreamingResponse(agen(), media_type="text/event-stream")
         else:
-            # Run blocking iteration off the event loop
+             # Run blocking iteration off the event loop
             out = await asyncio.to_thread(stream_tokens)
             await gen_task
             response = f"{''.join(out)}{lp_links_html}"
+            print(f"[gen] full response length={len(response)}, appended_links={bool(lp_links_html)}")
             return response
 
 # -----------------------------
@@ -381,9 +522,13 @@ async def version():
 
 @app.post("/v1/reindex")
 async def reindex(data: ReindexRequest, _=Depends(require_api_key)):
+    print(f"Reindex request: {data}")
     await ensure_ready()
     global _vstore
-    items = read_markdown_files(DATA_DIR)
+    items_md = read_markdown_files(DATA_DIR)
+    items_nb = read_notebook_files(NOTEBOOKS_DIR)
+    print(f"[reindex] md_items={len(items_md)}, nb_items={len(items_nb)}")
+    items = items_md + items_nb
     paths = read_learning_paths(DATA_DIR)
     
     LOG.info("Reindexing %d markdown files and %d learning paths from %s", len(items), len(paths), DATA_DIR)
@@ -391,70 +536,92 @@ async def reindex(data: ReindexRequest, _=Depends(require_api_key)):
     all_texts: List[str] = []
     metas: List[Dict[str, Any]] = []
     
+    print(f"[reindex] chunking {len(items)} items …")
     for it in items:
         chunks = split_markdown(it.get("text", ""), max_tokens=400)
+        print(f"[reindex] {it.get('path')} -> {len(chunks)} chunks")
         for i, ch in enumerate(chunks):
+            is_notebook = str(it.get("path", "")).endswith(".ipynb") or it.get("_source_type") == DWENGO_PYTHON_NOTEBOOK_TYPE
             meta = {
+                "text": ch,
                 "title": it.get("title"),
                 "path": it.get("path"),
                 "hruid": it.get("hruid"),
                 "language": it.get("language"),
                 "description": it.get("description"),
-                "type": DWENGO_WEBSITE_CONTENT_TYPE,
+                "type": DWENGO_PYTHON_NOTEBOOK_TYPE if is_notebook else DWENGO_WEBSITE_CONTENT_TYPE,
                 "chunk_id": i,
             }
             
-            # Attach learning path titles if this LO appears in any path
-            lp_indexes = []
-            if it.get("hruid"):
-                for lp in paths:
-                    for node in lp.get("nodes", []):
-                        if node.get("learningobject_hruid") == it["hruid"]:
-                            lp_indexes.append({
-                                "title": lp.get("title"),
-                                "hruid": lp.get("hruid"),
-                                "language": lp.get("language"),
-                            })
+            # Attach learning path titles for website content only
+            if not is_notebook:
+                lp_indexes = []
+                if it.get("hruid"):
+                    for lp in paths:
+                        for node in lp.get("nodes", []):
+                            if node.get("learningobject_hruid") == it["hruid"]:
+                                lp_indexes.append({
+                                    "title": lp.get("title"),
+                                    "hruid": lp.get("hruid"),
+                                    "language": lp.get("language"),
+                                })
                 if lp_indexes:
                     meta["learning_paths"] = lp_indexes
             
             metas.append(meta)
             all_texts.append(INSTRUCT_PASSAGE_PREFIX + ch)
 
+    print(f"[reindex] embedding {len(all_texts)} chunks …")
     embs = embed_passages(all_texts)
 
     store = VectorStore(embs.shape[1])
     store.add(embs, metas)
     store.save(INDEX_PATH, META_PATH)
+    print(f"[reindex] saved index={INDEX_PATH}, meta={META_PATH}")
     _vstore = store
     return {"status": "reindexed", "chunks": len(all_texts)}
 
 
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest, _=Depends(require_api_key)):
+    LOG.info(f'Received request: {body}')
+    print(f'Received request: {body}')
     await ensure_ready()
+    print(f"Ready to process chat request")
     hits = retrieve(body.query, body.k)
+    print(f"Retrieved {len(hits)} hits")
     prompt = build_prompt(body.query, hits, history=body.history)
+    print(f"Built prompt of length {len(prompt)}")
     
     # Add sources 
     lp_links = []
     for i, h in enumerate(hits, 1):
-        learning_paths = h.get("learning_paths", [])
-        for lp in learning_paths:
-            lp_hruid = lp.get("hruid", "?")
-            lp_lang = lp.get("language", "?")
-            lp_tt = lp.get("title", "?")
-            lp_links.append(f"<a href='https://dwengo.org/learning-path.html?hruid={lp_hruid}&language={lp_lang}&te=true'>{lp_tt}</a>")
+        type = h.get("type")
+        if type == DWENGO_WEBSITE_CONTENT_TYPE:
+            learning_paths = h.get("learning_paths", [])
+            for lp in learning_paths:
+                id = lp.get("hruid", "?")
+                lp_lang = lp.get("language", "?")
+                lp_tt = lp.get("title", "?")
+                lp_links.append(f"<a href='https://dwengo.org/learning-path.html?hruid={id}&language={lp_lang}&te=true' target='_blank'>{lp_tt}</a>")
+        elif type == DWENGO_PYTHON_NOTEBOOK_TYPE:
+            id = h.get("hruid", "?")
+            lp_links.append(f"<a href='https://kiks.ilabt.imec.be/hub/tmplogin?id={id}' target='_blank'>{h.get('title','?')}</a>")
     # remove duplicates from lp_links
     lp_links = list(dict.fromkeys(lp_links))
+    print(f"[chat] lp_links={len(lp_links)}")
+    for l in lp_links:
+        print(f"[chat-link]  {l}")
             
     
     if body.stream:
+        print("Starting streaming response")
         resp = await generate_text(prompt, body.max_new_tokens, body.temperature, body.top_p, stream=True, source_links=lp_links)
         return resp  # StreamingResponse
     else:
+        print("Starting non-streaming response")
         text = await generate_text(prompt, body.max_new_tokens, body.temperature, body.top_p, stream=False, source_links=lp_links)
-        return ChatResponse(response=text, retrieved=[{k: h.get(k) for k in ("path","title","language","score","chunk_id")} for h in hits])
+        return ChatResponse(response=cast(str, text), retrieved=[{k: h.get(k) for k in ("path","title","language","score","chunk_id")} for h in hits])
 
 # -----------------------------
 # Lifespan
@@ -467,31 +634,57 @@ async def on_startup():
         try:
             clone_or_update_repo(REPO_URL, DATA_DIR)
         except Exception as e:
-            LOG.error("Repository sync failed: %s", e)
+            LOG.error("Repository sync failed (content): %s", e)
+        try:
+            clone_or_update_repo(NOTEBOOKS_REPO_URL, NOTEBOOKS_DIR)
+        except Exception as e:
+            LOG.error("Repository sync failed (notebooks): %s", e)
 
     LOG.info("Loading embedding model: %s", EMB_MODEL)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    _embedder = SentenceTransformer(EMB_MODEL, device=device)
+    emb_device = "cpu"
+    _embedder = SentenceTransformer(EMB_MODEL, device=emb_device)
 
     if INDEX_PATH.exists() and META_PATH.exists():
         LOG.info("Loading FAISS index from disk")
         _vstore = VectorStore.load(INDEX_PATH, META_PATH)
     else:
         LOG.info("No index found. Building initial index from content…")
-        items = read_markdown_files(DATA_DIR)
+        items_md = read_markdown_files(DATA_DIR)
+        items_nb = read_notebook_files(NOTEBOOKS_DIR)
+        items = items_md + items_nb
+        print(f"[startup] md_items={len(items_md)}, nb_items={len(items_nb)}")
+        paths = read_learning_paths(DATA_DIR)
         all_texts: List[str] = []
         metas: List[Dict[str, Any]] = []
         for it in items:
-            chunks = split_markdown(it.get("text", ""), max_words=400)
+            chunks = split_markdown(it.get("text", ""), max_tokens=400)
             for i, ch in enumerate(chunks):
                 all_texts.append(INSTRUCT_PASSAGE_PREFIX + ch)
-                metas.append({
+                is_notebook = str(it.get("path", "")).endswith(".ipynb") or it.get("_source_type") == DWENGO_PYTHON_NOTEBOOK_TYPE
+                meta: Dict[str, Any] = {
                     "text": ch,
                     "title": it.get("title"),
                     "path": it.get("path"),
                     "language": it.get("language"),
+                    "hruid": it.get("hruid"),
+                    "type": DWENGO_PYTHON_NOTEBOOK_TYPE if is_notebook else DWENGO_WEBSITE_CONTENT_TYPE,
                     "chunk_id": i,
-                })
+                }
+                # Attach learning path info for website content only
+                if not is_notebook and it.get("hruid"):
+                    lp_indexes = []
+                    for lp in paths:
+                        for node in lp.get("nodes", []):
+                            if node.get("learningobject_hruid") == it["hruid"]:
+                                lp_indexes.append({
+                                    "title": lp.get("title"),
+                                    "hruid": lp.get("hruid"),
+                                    "language": lp.get("language"),
+                                })
+                    if lp_indexes:
+                        meta["learning_paths"] = lp_indexes
+                metas.append(meta)
         if all_texts:
             embs = embed_passages(all_texts)
             _vstore = VectorStore(embs.shape[1])
@@ -499,11 +692,12 @@ async def on_startup():
             _vstore.save(INDEX_PATH, META_PATH)
         else:
             dim = _embedder.get_sentence_embedding_dimension()
-            _vstore = VectorStore(dim)
+            _vstore = VectorStore(int(dim) if dim is not None else 768)
             _vstore.save(INDEX_PATH, META_PATH)
 
     LOG.info("Loading LLM: %s", LLM_MODEL)
-    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.bfloat16
+    print(f"[startup] loading model {LLM_MODEL} on device {device} with dtype {torch_dtype}")
     _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL, trust_remote_code=True)
     _model = AutoModelForCausalLM.from_pretrained(
         LLM_MODEL,
