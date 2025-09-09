@@ -186,7 +186,7 @@ def read_notebook_files(root: Path) -> List[Dict[str, Any]]:
     """
     items: List[Dict[str, Any]] = []
     index_path = root / "PythonNotebooks.json"
-    print(f"[ingest-nb] index: {index_path}")
+    print(f"[ingest-nb] index: {index_path}", flush=True)
     if not index_path.exists():
         LOG.warning("Notebook index JSON not found at %s; skipping notebook ingestion.", index_path)
         return items
@@ -222,24 +222,66 @@ def read_notebook_files(root: Path) -> List[Dict[str, Any]]:
                 if not p.exists() or not p.is_file():
                     LOG.warning("Listed notebook not found: %s (entry %s)", p, entry_key)
                     continue
+                # Size guard to avoid loading huge notebook files with embedded outputs
                 try:
-                    data = json.loads(p.read_text(encoding="utf-8"))
-                    
+                    size = p.stat().st_size
+                except Exception:
+                    size = 0
+                if NB_MAX_BYTES and size and size > NB_MAX_BYTES:
+                    LOG.warning("Skipping large notebook (%d bytes): %s", size, p)
+                    continue
+                try:
+                    # Load JSON and drop heavy fields early to reduce memory (outputs, attachments, etc.)
+                    def _nb_object_hook(o: Dict[str, Any]) -> Dict[str, Any]:
+                        # If it looks like a cell, keep only essentials
+                        if isinstance(o, dict) and "cell_type" in o:
+                            return {
+                                "cell_type": o.get("cell_type"),
+                                "source": o.get("source", []),
+                            }
+                        # Otherwise drop heavy keys if present
+                        if isinstance(o, dict):
+                            o.pop("outputs", None)
+                            o.pop("attachments", None)
+                            o.pop("metadata", None)
+                        return o
+
+                    with open(p, "r", encoding="utf-8") as f:
+                        data = json.load(f, object_hook=_nb_object_hook)
+
                     cells = data.get("cells", [])
                     parts: List[str] = []
+                    total_chars = 0
                     for cell in cells:
                         ctype = cell.get("cell_type")
                         src = cell.get("source", [])
                         src_text = "".join(src) if isinstance(src, list) else str(src)
                         if ctype == "markdown":
-                            parts.append(src_text)
+                            if src_text:
+                                if NB_MAX_TEXT_CHARS and (total_chars + len(src_text) > NB_MAX_TEXT_CHARS):
+                                    remain = max(0, NB_MAX_TEXT_CHARS - total_chars)
+                                    if remain > 0:
+                                        parts.append(src_text[:remain])
+                                        total_chars += remain
+                                    break
+                                parts.append(src_text)
+                                total_chars += len(src_text)
                         elif ctype == "code":
-                            if src_text.strip():
-                                parts.append(f"\n```python\n{src_text}\n```\n")
+                            if NB_INCLUDE_CODE and src_text.strip():
+                                code_snip = src_text[:NB_MAX_CODE_CHARS] if NB_MAX_CODE_CHARS else src_text
+                                block = f"\n```python\n{code_snip}\n```\n"
+                                if NB_MAX_TEXT_CHARS and (total_chars + len(block) > NB_MAX_TEXT_CHARS):
+                                    remain = max(0, NB_MAX_TEXT_CHARS - total_chars)
+                                    if remain > 0:
+                                        parts.append(block[:remain])
+                                        total_chars += remain
+                                    break
+                                parts.append(block)
+                                total_chars += len(block)
                     text = "\n\n".join([t for t in parts if t.strip()])
-                    print(f"[ingest-nb]  text: {text[:100]}... (truncated)")
+                    print(f"[ingest-nb]  text sample: {text[:120].replace('\n',' ')}… (truncated)")
                     lang = detect_language(entry_key, base_path, rel)
-                    print(f"[ingest-nb]  parsed {p} (lang={lang}, chunks TBD)")
+                    print(f"[ingest-nb]  parsed {p} (lang={lang}, chars={len(text)})")
                     items.append({
                         "path": str(p),
                         "text": text,
@@ -281,56 +323,34 @@ def split_markdown(text: str, max_tokens: int = 400) -> List[str]:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
     # Split by top-level headers first
-    parts = re.split(r"\n(?=#+\s)" , text)
+    parts = re.split(r"\n(?=#+\s)", text)
 
-    chunks = []
-            for rel in files:
+    chunks: List[str] = []
+    for part in parts:
         words = part.split()
         if not words:
             continue
-        cur = []
+        cur: List[str] = []
         count = 0
         for w in words:
             cur.append(w)
-                try:
-                    size = p.stat().st_size
-                except Exception:
-                    size = 0
-                if NB_MAX_BYTES and size and size > NB_MAX_BYTES:
-                    LOG.warning("Skipping large notebook (%d bytes): %s", size, p)
-                    continue
             count += 1
             if count >= max_tokens:
                 chunks.append(" ".join(cur))
                 cur = []
-                    total_chars = 0
                 count = 0
         if cur:
             chunks.append(" ".join(cur))
 
-    # Fallback if no headers
-                            if src_text:
-                                if NB_MAX_TEXT_CHARS and (total_chars + len(src_text) > NB_MAX_TEXT_CHARS):
-                                    remain = max(0, NB_MAX_TEXT_CHARS - total_chars)
-                                    parts.append(src_text[:remain])
-                                    total_chars += remain
-                                    break
-                                parts.append(src_text)
-                                total_chars += len(src_text)
+    # Fallback if no headers produced chunks
+    if not chunks:
         words = text.split()
-                            if NB_INCLUDE_CODE and src_text.strip():
-                                code_snip = src_text[:NB_MAX_CODE_CHARS] if NB_MAX_CODE_CHARS else src_text
-                                block = f"\n```python\n{code_snip}\n```\n"
-                                if NB_MAX_TEXT_CHARS and (total_chars + len(block) > NB_MAX_TEXT_CHARS):
-                                    remain = max(0, NB_MAX_TEXT_CHARS - total_chars)
-                                    parts.append(block[:remain])
-                                    total_chars += remain
-                                    break
-                                parts.append(block)
-                                total_chars += len(block)
+        cur: List[str] = []
+        for w in words:
             cur.append(w)
             if len(cur) >= max_tokens:
-                chunks.append(" ".join(cur)); cur = []
+                chunks.append(" ".join(cur))
+                cur = []
         if cur:
             chunks.append(" ".join(cur))
 
@@ -482,9 +502,8 @@ async def generate_text(prompt: str, max_new_tokens: int, temperature: float, to
         def stream_tokens():
             for token in streamer:
                 yield token
-
         gen_task = loop.create_task(thread)
-        lp_links_html =  f"<br>Bronnen:<br>{"<br>".join(source_links)}"
+        lp_links_html = f"<br>Bronnen:<br>{'<br>'.join(source_links)}" if source_links else ""
 
         if stream:
             async def agen():
@@ -499,10 +518,12 @@ async def generate_text(prompt: str, max_new_tokens: int, temperature: float, to
                 print(f"[gen] streamed tokens={token_count}, appended_links={bool(lp_links_html)}")
             return StreamingResponse(agen(), media_type="text/event-stream")
         else:
-             # Run blocking iteration off the event loop
-            out = await asyncio.to_thread(stream_tokens)
+            # Collect tokens until generation completes
+            out_tokens: List[str] = []
+            for tok in stream_tokens():
+                out_tokens.append(tok)
             await gen_task
-            response = f"{''.join(out)}{lp_links_html}"
+            response = f"{''.join(out_tokens)}{lp_links_html}"
             print(f"[gen] full response length={len(response)}, appended_links={bool(lp_links_html)}")
             return response
 
@@ -595,6 +616,7 @@ async def chat(body: ChatRequest, _=Depends(require_api_key)):
     
     # Add sources 
     lp_links = []
+    notebook_titles = []
     for i, h in enumerate(hits, 1):
         type = h.get("type")
         if type == DWENGO_WEBSITE_CONTENT_TYPE:
@@ -606,7 +628,11 @@ async def chat(body: ChatRequest, _=Depends(require_api_key)):
                 lp_links.append(f"<a href='https://dwengo.org/learning-path.html?hruid={id}&language={lp_lang}&te=true' target='_blank'>{lp_tt}</a>")
         elif type == DWENGO_PYTHON_NOTEBOOK_TYPE:
             id = h.get("hruid", "?")
-            lp_links.append(f"<a href='https://kiks.ilabt.imec.be/hub/tmplogin?id={id}' target='_blank'>{h.get('title','?')}</a>")
+            title = h.get("title", "?")
+            if title not in notebook_titles:
+                # avoid duplicates based on title
+                notebook_titles.append(title)
+                lp_links.append(f"<a href='https://kiks.ilabt.imec.be/hub/tmplogin?id={id}' target='_blank'>{h.get('title','?')}</a>")
     # remove duplicates from lp_links
     lp_links = list(dict.fromkeys(lp_links))
     print(f"[chat] lp_links={len(lp_links)}")
@@ -642,7 +668,7 @@ async def on_startup():
 
     LOG.info("Loading embedding model: %s", EMB_MODEL)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    emb_device = "cpu"
+    emb_device = "cuda" if torch.cuda.is_available() else "cpu"
     _embedder = SentenceTransformer(EMB_MODEL, device=emb_device)
 
     if INDEX_PATH.exists() and META_PATH.exists():

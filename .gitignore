@@ -4,3 +4,6 @@ dwengo_faiss.index
 .venv
 dwengo_faiss.meta.json
 __pycache__
+python_notebooks
+dwengo_faiss2.index
+dwengo_faiss2.meta.json
